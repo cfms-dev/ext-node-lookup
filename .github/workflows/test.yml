@@ -1,0 +1,44 @@
+name: Run Tests
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out extension
+        uses: actions/checkout@v6
+        with:
+          path: ext_node_lookup
+
+      - name: Check out CFMS server
+        uses: actions/checkout@v6
+        with:
+          repository: cfms-dev/cfms_on_websocket
+          ref: dev
+          path: cfms_on_websocket
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        run: python -m pip install uv
+
+      - name: Install server dependencies
+        run: uv sync --project cfms_on_websocket --dev --all-extras
+
+      - name: Run isolated extension tests
+        env:
+          CFMS_SERVER_ROOT: ${{ github.workspace }}/cfms_on_websocket
+        run: >-
+          uv run --project cfms_on_websocket pytest ext_node_lookup/tests
+          -v --tb=short

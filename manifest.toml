@@ -1,0 +1,8 @@
+manifest_version = 1
+identifier = "node_lookup"
+name = "Node Lookup"
+version = "0.1.0"
+authors = ["Creeper19472"]
+license = "Apache-2.0"
+description = "Resolve human-readable node paths to authorized database ID chains."
+homepage = "https://github.com/cfms-dev/ext_node_lookup"
