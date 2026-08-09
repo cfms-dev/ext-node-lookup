@@ -7,9 +7,9 @@ from _path import parse_node_path
 
 @pytest.fixture(autouse=True)
 def _load_resolver_after_runtime_setup():
-    global resolve_authorized_node_ids
+    global _build_path_query, resolve_authorized_node_ids
 
-    from _resolver import resolve_authorized_node_ids
+    from _resolver import _build_path_query, resolve_authorized_node_ids
 
 
 def _make_user(models, session, *, username="alice", groups=()):
@@ -346,4 +346,39 @@ def test_authorization_queries_have_a_fixed_overhead_over_path_resolution(
         event.remove(bind, "before_cursor_execute", _count_statement)
 
     assert result == tuple(expected_ids)
-    assert statement_count <= len(segments) + 12
+    assert statement_count <= 12, statement_count
+
+
+@pytest.mark.parametrize("dialect_name", ["sqlite", "postgresql", "mysql"])
+def test_recursive_path_query_compiles_for_supported_dialects(dialect_name) -> None:
+    from sqlalchemy.dialects import mysql, postgresql, sqlite
+
+    dialects = {
+        "sqlite": sqlite.dialect(),
+        "postgresql": postgresql.dialect(),
+        "mysql": mysql.dialect(),
+    }
+
+    sql = str(
+        _build_path_query(("projects", "repository")).compile(
+            dialect=dialects[dialect_name]
+        )
+    )
+
+    assert "WITH RECURSIVE" in sql.upper()
+    assert "active_parent_id" in sql
+    assert "node_lookup_child.name" in sql
+
+
+def test_recursive_path_query_uses_active_parent_name_index(database_session) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.dialects import sqlite
+
+    _, session = database_session
+    statement = _build_path_query(("projects", "repository")).compile(
+        dialect=sqlite.dialect(),
+        compile_kwargs={"literal_binds": True},
+    )
+    plan = session.execute(text(f"EXPLAIN QUERY PLAN {statement}")).all()
+
+    assert any("active_parent_id=? AND name=?" in detail for *_, detail in plan), plan

@@ -3,97 +3,161 @@
 import time
 from collections.abc import Sequence
 
+from sqlalchemy import case, literal, select
 from sqlalchemy.orm import Session as OrmSession
 
 from include.config.constants import ROOT_DIRECTORY_ID
-from include.database.models.documents import Document, EntityStatus, Folder, Node
+from include.database.models.documents import (
+    Document,
+    EntityStatus,
+    Folder,
+    Node,
+    NodeType,
+)
 from include.database.models.identity import User
 from include.domains.access.authorization.compiled_rules import (
+    TargetType,
     compiled_rules_allow_from_map,
     fetch_compiled_access_rules_for_targets,
 )
-from include.domains.access.authorization.evaluation import (
-    load_folder_access_evaluation_context,
+from include.domains.access.authorization.grants import (
+    batch_prefetch_granted_ids,
+    prefetch_user_blocks,
 )
-from include.domains.access.authorization.grants import batch_prefetch_granted_ids
 
 __all__ = ["resolve_authorized_node_ids"]
+
+
+def _build_path_query(segments: Sequence[str]):
+    nodes = Node.__table__
+    path = (
+        select(
+            nodes.c.id.label("id"),
+            nodes.c.type.label("type"),
+            literal(0).label("depth"),
+        )
+        .where(
+            nodes.c.id == ROOT_DIRECTORY_ID,
+            nodes.c.type == NodeType.DIRECTORY.value,
+            nodes.c.status != EntityStatus.DELETED,
+        )
+        .cte("node_lookup_path", recursive=True)
+    )
+    child = nodes.alias("node_lookup_child")
+    expected_name = case(
+        *((path.c.depth == depth, segment) for depth, segment in enumerate(segments)),
+        else_=None,
+    )
+    path = path.union_all(
+        select(
+            child.c.id,
+            child.c.type,
+            (path.c.depth + 1).label("depth"),
+        )
+        .select_from(
+            path.join(
+                child,
+                child.c.active_parent_id == path.c.id,
+            )
+        )
+        .where(
+            path.c.type == NodeType.DIRECTORY.value,
+            path.c.depth < len(segments),
+            child.c.name == expected_name,
+        )
+    )
+    return (
+        select(Node, path.c.depth)
+        .select_from(path.join(nodes, nodes.c.id == path.c.id))
+        .order_by(path.c.depth)
+    )
 
 
 def _resolve_chain(
     session: OrmSession, segments: Sequence[str]
 ) -> list[Folder | Document] | None:
-    root = session.get(Folder, ROOT_DIRECTORY_ID)
-    if root is None or root.status == EntityStatus.DELETED:
+    if not segments:
+        root = session.get(Folder, ROOT_DIRECTORY_ID)
+        if root is None or root.status == EntityStatus.DELETED:
+            return None
+        return [root]
+
+    rows = session.execute(_build_path_query(segments)).all()
+    expected_depths = list(range(len(segments) + 1))
+    if [depth for _, depth in rows] != expected_depths:
         return None
 
-    chain: list[Folder | Document] = [root]
-    visited_ids = {root.id}
-    parent: Folder = root
-    for index, segment in enumerate(segments):
-        node = (
-            session.query(Node)
-            .filter(
-                Node.parent_id == parent.id,
-                Node.name == segment,
-                Node.status != EntityStatus.DELETED,
-            )
-            .one_or_none()
-        )
-        if node is None:
-            return None
-        if node.id in visited_ids:
-            return None
-        visited_ids.add(node.id)
+    chain = [node for node, _ in rows]
+    if len({node.id for node in chain}) != len(chain):
+        return None
+    if not all(isinstance(node, Folder) for node in chain[:-1]):
+        return None
 
-        is_terminal = index == len(segments) - 1
-        if not is_terminal and not isinstance(node, Folder):
-            return None
-        if is_terminal and isinstance(node, Document) and not node.active:
-            return None
-
-        chain.append(node)
-        if isinstance(node, Folder):
-            parent = node
+    terminal = chain[-1]
+    if isinstance(terminal, Document) and not terminal.active:
+        return None
 
     return chain
 
 
-def _document_is_readable(
+def _target_type(node: Folder | Document) -> TargetType:
+    return "document" if isinstance(node, Document) else "directory"
+
+
+def _chain_is_readable(
     session: OrmSession,
     user: User,
-    document: Document,
-    *,
-    is_globally_blocked: bool,
-    blocked_ids: set[str],
+    chain: Sequence[Folder | Document],
 ) -> bool:
-    if is_globally_blocked or document.id in blocked_ids:
-        return False
-
     now = time.time()
-    granted_ids = batch_prefetch_granted_ids(
+    is_globally_blocked, blocked_ids = prefetch_user_blocks(
         session,
         user,
-        [document.id],
-        "document",
         "read",
         now,
     )
-    if document.id in granted_ids:
-        return True
+    if is_globally_blocked:
+        return False
 
-    rules = fetch_compiled_access_rules_for_targets(
+    targets = [(_target_type(node), node.id) for node in chain]
+    compiled_rules = fetch_compiled_access_rules_for_targets(
         session,
-        (("document", document.id),),
+        targets,
         access_type="read",
     )
-    return compiled_rules_allow_from_map(
-        rules,
-        target_type="document",
-        target_id=document.id,
-        user=user,
-        access_type="read",
-    )
+
+    granted_ids_by_type: dict[TargetType, set[str]] = {}
+    for target_type in ("directory", "document"):
+        target_ids = [
+            target_id
+            for this_type, target_id in targets
+            if this_type == target_type
+        ]
+        if target_ids:
+            granted_ids_by_type[target_type] = batch_prefetch_granted_ids(
+                session,
+                user,
+                target_ids,
+                target_type,
+                "read",
+                now,
+            )
+
+    for node in chain:
+        if node.id in blocked_ids:
+            return False
+        target_type = _target_type(node)
+        if node.id in granted_ids_by_type.get(target_type, set()):
+            continue
+        if not compiled_rules_allow_from_map(
+            compiled_rules,
+            target_type=target_type,
+            target_id=node.id,
+            user=user,
+            access_type="read",
+        ):
+            return False
+    return True
 
 
 def resolve_authorized_node_ids(
@@ -106,24 +170,7 @@ def resolve_authorized_node_ids(
     if chain is None:
         return None
 
-    folders = [node for node in chain if isinstance(node, Folder)]
-    access_context = load_folder_access_evaluation_context(
-        session,
-        folders,
-        user,
-        "read",
-    )
-    if any(not access_context.allows(folder) for folder in folders):
-        return None
-
-    terminal = chain[-1]
-    if isinstance(terminal, Document) and not _document_is_readable(
-        session,
-        user,
-        terminal,
-        is_globally_blocked=access_context.is_globally_blocked,
-        blocked_ids=access_context.blocked_ids,
-    ):
+    if not _chain_is_readable(session, user, chain):
         return None
 
     return tuple(node.id for node in chain)

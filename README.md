@@ -98,6 +98,21 @@ include the submitted path or partial IDs. The handler uses the server's normal
 request rate control with a default cost of 3 and does not cache authorization
 results.
 
+## Performance
+
+For non-root paths, the resolver uses one recursive database query for the
+complete path. Each recursive step joins through the server's existing active
+`parent + name` index, so sibling count does not require a linear scan. Access
+rules, object grants, and user blocks are then loaded in batches and evaluated
+once over the returned chain.
+
+Database round trips therefore remain constant as path depth grows; only the
+number of rows and in-process authorization checks grows linearly. The test
+suite enforces a fixed query budget at the maximum supported depth and verifies
+the SQLite index plan as well as SQLite and MySQL query compilation. Results are
+intentionally not cached, because doing so could expose stale authorization or
+rename/move state.
+
 ## Testing
 
 Use the server's uv environment. Tests create only temporary SQLite databases
