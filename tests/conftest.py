@@ -51,3 +51,28 @@ def isolated_server_runtime(server_root: Path, tmp_path_factory):
             sys.path.remove(server_src)
         except ValueError:
             pass
+
+
+@pytest.fixture()
+def database_session():
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import sessionmaker
+
+    import include.database.models as models
+    from include.database.session import Base
+
+    engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    testing_session = sessionmaker(bind=engine)
+    with testing_session() as session:
+        session.add(models.Folder(id="/", name="/", inherit=False))
+        session.commit()
+        yield models, session
+    engine.dispose()
