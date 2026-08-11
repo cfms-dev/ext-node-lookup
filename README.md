@@ -4,7 +4,9 @@
 absolute node path to its database ID chain. A result is returned only when the
 caller can read every node in the path, including the root and all ancestors.
 
-The initial release targets CFMS server `0.4.1.260801_alpha`, protocol 21.
+Version `0.2.0` targets CFMS server `0.4.1.260811_alpha` or newer, protocol
+21. Its version 2 manifest lets the server reject incompatible installations
+before importing the extension.
 
 ## Installation
 
