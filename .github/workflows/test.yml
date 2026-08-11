@@ -37,8 +37,9 @@ jobs:
         run: uv sync --project cfms_on_websocket --dev --all-extras
 
       - name: Run isolated extension tests
+        working-directory: ext_node_lookup
         env:
           CFMS_SERVER_ROOT: ${{ github.workspace }}/cfms_on_websocket
         run: >-
-          uv run --project cfms_on_websocket pytest ext_node_lookup/tests
+          uv run --project ../cfms_on_websocket pytest tests
           -v --tb=short

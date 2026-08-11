@@ -1,0 +1,258 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to release (for example, v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-test:
+    name: Validate and test
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve release version
+        id: release
+        env:
+          TARGET_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$TARGET_TAG" =~ $tag_pattern ]]; then
+            echo "::error::Release tag must match vMAJOR.MINOR.PATCH: $TARGET_TAG"
+            exit 1
+          fi
+
+          echo "tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TARGET_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out extension
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          path: ext_node_lookup
+
+      - name: Check out CFMS server
+        uses: actions/checkout@v6
+        with:
+          repository: cfms-dev/cfms_on_websocket
+          ref: dev
+          path: cfms_on_websocket
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Validate manifest version
+        working-directory: ext_node_lookup
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("manifest.toml").read_text(encoding="utf-8"))
+          manifest_version = manifest["extension"]["version"]
+          release_version = os.environ["RELEASE_VERSION"]
+          if manifest_version != release_version:
+              raise SystemExit(
+                  f"manifest version {manifest_version!r} does not match "
+                  f"release version {release_version!r}"
+              )
+          PY
+
+      - name: Set up uv
+        run: python -m pip install uv
+
+      - name: Install server dependencies
+        run: uv sync --project cfms_on_websocket --dev --all-extras
+
+      - name: Run isolated extension tests
+        working-directory: ext_node_lookup
+        env:
+          CFMS_SERVER_ROOT: ${{ github.workspace }}/cfms_on_websocket
+        run: >-
+          uv run --project ../cfms_on_websocket pytest tests
+          -v --tb=short
+
+  package:
+    name: Build and verify packages
+    needs: validate-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out extension
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate-and-test.outputs.tag }}
+          path: ext_node_lookup
+
+      - name: Check out CFMS server
+        uses: actions/checkout@v6
+        with:
+          repository: cfms-dev/cfms_on_websocket
+          ref: dev
+          path: cfms_on_websocket
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        run: python -m pip install uv
+
+      - name: Install server dependencies
+        run: uv sync --project cfms_on_websocket --dev --all-extras
+
+      - name: Build release archives
+        env:
+          RELEASE_VERSION: ${{ needs.validate-and-test.outputs.version }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          import shutil
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          repository = Path("ext_node_lookup")
+          source = repository / "src"
+          dist = Path("dist")
+          package_root = dist / "staging" / "node_lookup"
+          package_files = (
+              "_extension.py",
+              "_path.py",
+              "_resolver.py",
+          )
+          repository_files = (
+              "manifest.toml",
+              "README.md",
+              "LICENSE",
+          )
+
+          package_root.mkdir(parents=True)
+          for filename in package_files:
+              shutil.copy2(source / filename, package_root / filename)
+          for filename in repository_files:
+              shutil.copy2(repository / filename, package_root / filename)
+
+          zip_path = dist / f"node_lookup-{version}.zip"
+          tar_path = dist / f"node_lookup-{version}.tar.gz"
+          archive_files = (*package_files, *repository_files)
+
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for filename in archive_files:
+                  archive.write(package_root / filename, f"node_lookup/{filename}")
+
+          with tarfile.open(tar_path, "w:gz") as archive:
+              for filename in archive_files:
+                  archive.add(package_root / filename, arcname=f"node_lookup/{filename}")
+
+          expected = {
+              f"node_lookup/{filename}"
+              for filename in archive_files
+          }
+          with zipfile.ZipFile(zip_path) as archive:
+              zip_files = {item.filename for item in archive.infolist() if not item.is_dir()}
+              if zip_files != expected:
+                  raise SystemExit(f"unexpected ZIP contents: {sorted(zip_files)}")
+              archive.extractall(dist / "verification" / "zip")
+
+          with tarfile.open(tar_path, "r:gz") as archive:
+              tar_files = {item.name for item in archive.getmembers() if item.isfile()}
+              if tar_files != expected:
+                  raise SystemExit(f"unexpected tar.gz contents: {sorted(tar_files)}")
+              archive.extractall(dist / "verification" / "tar")
+
+          checksum_lines = []
+          for archive_path in (zip_path, tar_path):
+              digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+              checksum_lines.append(f"{digest}  {archive_path.name}")
+          (dist / "SHA256SUMS.txt").write_text(
+              "\n".join(checksum_lines) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Verify packages with the server extension loader
+        env:
+          PYTHONPATH: ${{ github.workspace }}/cfms_on_websocket/src
+          RELEASE_VERSION: ${{ needs.validate-and-test.outputs.version }}
+        run: |
+          uv run --project cfms_on_websocket python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from include.extensions.manager import discover_extensions
+
+          expected_version = os.environ["RELEASE_VERSION"]
+          for archive_type in ("zip", "tar"):
+              root = Path("dist") / "verification" / archive_type
+              discovered = discover_extensions(root)
+              if set(discovered) != {"node_lookup"}:
+                  raise SystemExit(
+                      f"{archive_type} package discovery returned {sorted(discovered)}"
+                  )
+              extension = discovered["node_lookup"]
+              actual_version = extension.manifest.extension.version
+              if actual_version != expected_version:
+                  raise SystemExit(
+                      f"{archive_type} package version {actual_version!r} does not "
+                      f"match {expected_version!r}"
+                  )
+          PY
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: node_lookup-${{ needs.validate-and-test.outputs.version }}
+          path: |
+            dist/node_lookup-${{ needs.validate-and-test.outputs.version }}.zip
+            dist/node_lookup-${{ needs.validate-and-test.outputs.version }}.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate-and-test
+      - package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          name: node_lookup-${{ needs.validate-and-test.outputs.version }}
+          path: dist
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-and-test.outputs.tag }}
+          name: Node Lookup ${{ needs.validate-and-test.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/node_lookup-${{ needs.validate-and-test.outputs.version }}.zip
+            dist/node_lookup-${{ needs.validate-and-test.outputs.version }}.tar.gz
+            dist/SHA256SUMS.txt

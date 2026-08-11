@@ -10,12 +10,32 @@ before importing the extension.
 
 ## Installation
 
-Clone or copy this repository into the server extension catalog so that its
-manifest is located at:
+Download either `node_lookup-X.Y.Z.tar.gz` or `node_lookup-X.Y.Z.zip` from the
+corresponding [GitHub Release](https://github.com/cfms-dev/ext_node_lookup/releases).
+You may verify the downloaded archive with the accompanying `SHA256SUMS.txt`:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS.txt
+```
+
+Extract the archive directly into the server extension catalog. For example,
+on Linux:
+
+```bash
+tar -xzf node_lookup-X.Y.Z.tar.gz \
+  -C cfms_on_websocket/src/include/extensions
+```
+
+The resulting manifest must be located at:
 
 ```text
 cfms_on_websocket/src/include/extensions/node_lookup/manifest.toml
 ```
+
+When installing directly from source, create that `node_lookup` directory, copy
+the contents of this repository's `src/` directory into it, and then copy
+`manifest.toml` into the same directory. `README.md` and `LICENSE` may also be
+copied for reference.
 
 Enable it in `config.toml` and restart the server:
 

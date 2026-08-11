@@ -10,7 +10,7 @@ import pytest
 
 @pytest.fixture(scope="session")
 def extension_module(isolated_server_runtime):
-    extension_root = Path(__file__).resolve().parents[1]
+    extension_root = Path(__file__).resolve().parents[1] / "src"
     spec = importlib.util.spec_from_file_location(
         "node_lookup",
         extension_root / "_extension.py",
