@@ -291,6 +291,100 @@ def test_group_oae_can_authorize_a_visible_terminal(database_session) -> None:
     )
 
 
+def test_group_oae_does_not_match_a_same_named_user(database_session) -> None:
+    models, session = database_session
+    user = _make_user(models, session, username="shared-name")
+    session.add(
+        models.UserGroup(
+            group_name="shared-name",
+            group_display_name="shared-name",
+        )
+    )
+    root = session.get(models.Folder, "/")
+    folder = _add_folder(models, session, "folder", "folder", root)
+    _deny_read(models, folder, session)
+    session.add(
+        models.ObjectAccessEntry(
+            entity_type="group",
+            entity_identifier="shared-name",
+            target_type="directory",
+            target_identifier=folder.id,
+            access_type="read",
+            start_time=0.0,
+            end_time=None,
+        )
+    )
+    session.flush()
+
+    assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+
+
+def test_user_oae_does_not_match_a_same_named_group(database_session) -> None:
+    models, session = database_session
+    _make_user(models, session, username="shared-name")
+    user = _make_user(models, session, username="alice", groups=("shared-name",))
+    root = session.get(models.Folder, "/")
+    folder = _add_folder(models, session, "folder", "folder", root)
+    _deny_read(models, folder, session)
+    session.add(
+        models.ObjectAccessEntry(
+            entity_type="user",
+            entity_identifier="shared-name",
+            target_type="directory",
+            target_identifier=folder.id,
+            access_type="read",
+            start_time=0.0,
+            end_time=None,
+        )
+    )
+    session.flush()
+
+    assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+
+
+@pytest.mark.parametrize(
+    ("membership_start", "membership_end"),
+    [(time.time() + 3600, None), (0.0, time.time() - 3600)],
+    ids=["future", "expired"],
+)
+def test_group_oae_requires_an_active_membership(
+    database_session, membership_start, membership_end
+) -> None:
+    models, session = database_session
+    user = _make_user(models, session, username="alice")
+    session.add(
+        models.UserGroup(
+            group_name="readers",
+            group_display_name="readers",
+        )
+    )
+    membership = models.UserMembership(
+        username=user.username,
+        group_name="readers",
+        start_time=membership_start,
+        end_time=None,
+    )
+    user.groups.append(membership)
+    membership.end_time = membership_end
+    root = session.get(models.Folder, "/")
+    folder = _add_folder(models, session, "folder", "folder", root)
+    _deny_read(models, folder, session)
+    session.add(
+        models.ObjectAccessEntry(
+            entity_type="group",
+            entity_identifier="readers",
+            target_type="directory",
+            target_identifier=folder.id,
+            access_type="read",
+            start_time=0.0,
+            end_time=None,
+        )
+    )
+    session.flush()
+
+    assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+
+
 def test_non_inheriting_child_still_requires_visible_path_ancestors(
     database_session,
 ) -> None:

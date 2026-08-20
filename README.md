@@ -4,8 +4,8 @@
 absolute node path to its database ID chain. A result is returned only when the
 caller can read every node in the path, including the root and all ancestors.
 
-Version `0.2.0` targets CFMS server `0.4.1.260811_alpha` or newer, protocol
-21. Its version 2 manifest lets the server reject incompatible installations
+Version `0.3.1` targets CFMS server `0.5.0.260820_alpha` or newer, protocol
+22. Its version 2 manifest lets the server reject incompatible installations
 before importing the extension.
 
 ## Installation
@@ -100,8 +100,10 @@ For example, `/teams%2Fsecurity/100%25` addresses the two node names
 
 Authentication alone permits invoking the action; no `search` permission is
 required. Existing read rules, inheritance, direct and group object access
-entries, and user blocks are evaluated for every node. A direct grant on the
-terminal node never makes hidden ancestors visible, and
+entries, and user blocks are evaluated for every node. User and group grants
+remain in separate principal namespaces, and group grants apply only through a
+currently active membership. A direct grant on the terminal node never makes
+hidden ancestors visible, and
 `super_list_directory` is not treated as an implicit bypass.
 
 Missing, deleted, inaccessible, structurally invalid, and unpublished document

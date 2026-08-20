@@ -4,8 +4,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import jsonschema
 import pytest
+from pydantic import ValidationError
 
 
 @pytest.fixture(scope="session")
@@ -73,19 +73,26 @@ def _install_testing_session(monkeypatch, extension_module, session) -> None:
 
 
 def test_registers_action_capability_and_transport_contract(extension_module) -> None:
+    from include.transport.request_handler import validate_request_handler_models
+
     handlers = extension_module.ext_register_handlers()
     handler_type = handlers["node_lookup"]
 
     assert extension_module.ext_register_extension_flags() == {"node_lookup"}
     assert handler_type.require_auth is True
     assert handler_type.rate_limit_cost == 3
-    jsonschema.validate({"path": "/projects"}, handler_type.schema)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(
-            {"path": "/projects", "unexpected": True}, handler_type.schema
+    validate_request_handler_models(handlers)
+    assert handler_type.request_model.model_validate({"path": "/projects"}).path == (
+        "/projects"
+    )
+    with pytest.raises(ValidationError):
+        handler_type.request_model.model_validate(
+            {"path": "/projects", "unexpected": True}
         )
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({"path": "/" + "a" * 4096}, handler_type.schema)
+    with pytest.raises(ValidationError):
+        handler_type.request_model.model_validate({"path": "/" + "a" * 4096})
+    with pytest.raises(ValidationError):
+        handler_type.request_model.model_validate({"path": 1})
 
 
 def test_success_returns_rooted_chain_and_audits_only_terminal_id(

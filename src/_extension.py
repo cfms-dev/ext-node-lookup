@@ -1,28 +1,25 @@
 """CFMS node lookup extension entrypoint."""
 
+from typing import Annotated
+
+from pydantic import Field
+
 from include.database.models.identity import User
 from include.database.session import Session
 from include.extensions.manager import hookimpl
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import RequestDataModel, RequestHandler, Result
 
 from ._path import MAX_PATH_LENGTH, NodePathError, parse_node_path
 from ._resolver import resolve_authorized_node_ids
 
 
+class _NodeLookupRequest(RequestDataModel):
+    path: Annotated[str, Field(min_length=1, max_length=MAX_PATH_LENGTH)]
+
+
 class RequestNodeLookupHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": MAX_PATH_LENGTH,
-            }
-        },
-        "required": ["path"],
-        "additionalProperties": False,
-    }
+    request_model = _NodeLookupRequest
     require_auth = True
     rate_limit_cost = 3
 
