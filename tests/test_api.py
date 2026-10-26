@@ -354,6 +354,77 @@ def test_router_enforces_authentication_and_token_purpose(
         assert routed_lookup.audits[0]["user_id"] == USER_ID
 
 
+@pytest.mark.parametrize("status", [1, 99], ids=["disabled", "unknown"])
+def test_router_rejects_non_active_accounts(routed_lookup, status) -> None:
+    routed_lookup.user.status = status
+    routed_lookup.session.commit()
+
+    response = routed_lookup.send({"path": "/"})
+
+    assert response["code"] == 401, response
+    assert response["data"] == {}
+    assert routed_lookup.dispatched == []
+
+
+def test_router_enforces_rate_limit_before_lookup(monkeypatch, routed_lookup) -> None:
+    from include.transport import router
+
+    monkeypatch.setattr(
+        router,
+        "check_request_rate",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            allowed=False, scope="user", limit=3, retry_after_seconds=1
+        ),
+    )
+
+    response = routed_lookup.send({"path": "/"})
+
+    assert response["code"] == 429, response
+    assert response["data"]["scope"] == "user"
+    assert routed_lookup.dispatched == []
+
+
+def test_router_enforces_lockdown_before_lookup(monkeypatch, routed_lookup) -> None:
+    from include.transport import router
+
+    monkeypatch.setattr(
+        router.lockdown_state_manager,
+        "get_state",
+        lambda: SimpleNamespace(enabled=True, as_response_data=lambda: {}),
+    )
+
+    response = routed_lookup.send({"path": "/"})
+
+    assert response["code"] == 999, response
+    assert response["data"] == {}
+    assert routed_lookup.dispatched == []
+
+
+@pytest.mark.parametrize("envelope", [{"nonce": "short"}, {"timestamp": 0}])
+def test_router_requires_replay_protection(routed_lookup, envelope) -> None:
+    response = routed_lookup.send({"path": "/"}, **envelope)
+
+    assert response["code"] == 400, response
+    assert response["data"] == {}
+    assert routed_lookup.dispatched == []
+
+
+def test_router_honors_replay_rejection(monkeypatch, routed_lookup) -> None:
+    from include.transport import router
+
+    monkeypatch.setattr(
+        router.nonce_store,
+        "validate_and_store",
+        lambda _nonce, _timestamp: "replayed request",
+    )
+
+    response = routed_lookup.send({"path": "/"})
+
+    assert response["code"] == 1001, response
+    assert response["data"] == {}
+    assert routed_lookup.dispatched == []
+
+
 @pytest.mark.parametrize(
     ("data", "error_type", "location"),
     [

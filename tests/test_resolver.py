@@ -181,6 +181,91 @@ def test_terminal_document_requires_an_active_revision(database_session) -> None
     assert resolve_authorized_node_ids(session, user, ("inactive",)) is None
 
 
+@pytest.mark.parametrize("active", [False, True], ids=["unpublished", "published"])
+@pytest.mark.parametrize("linked", [False, True], ids=["fallback", "parent-chain"])
+def test_document_revision_history_has_a_fixed_query_budget(
+    database_session, active, linked
+) -> None:
+    from sqlalchemy import event
+
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    document = _add_document(
+        models, session, "document", "document", root, active=active
+    )
+    parent = document.current_revision
+    for index in range(128):
+        stored_file = models.File(
+            id=f"history-file-{index}",
+            path=f"{index}.bin",
+            active=active and not linked and index < 127,
+        )
+        revision = models.DocumentRevision(
+            id=f"history-revision-{index}",
+            document=document,
+            file=stored_file,
+            parent_revision=parent if linked else None,
+        )
+        session.add_all([stored_file, revision])
+        parent = revision
+    document.current_revision = parent
+    session.commit()
+    session.expire_all()
+
+    statement_count = 0
+
+    def _count_statement(*_args) -> None:
+        nonlocal statement_count
+        statement_count += 1
+
+    bind = session.get_bind()
+    event.listen(bind, "before_cursor_execute", _count_statement)
+    try:
+        result = resolve_authorized_node_ids(session, user, ("document",))
+    finally:
+        event.remove(bind, "before_cursor_execute", _count_statement)
+
+    assert result == (("/", "document") if active else None)
+    assert statement_count <= 12, statement_count
+
+
+def test_hidden_document_does_not_load_revision_history(database_session) -> None:
+    from sqlalchemy import event
+
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    document = _add_document(models, session, "document", "document", root)
+    _deny_read(models, document, session)
+    session.commit()
+    session.expire_all()
+    statements = []
+
+    def _capture_statement(_connection, _cursor, statement, *_args) -> None:
+        statements.append(statement.lower())
+
+    bind = session.get_bind()
+    event.listen(bind, "before_cursor_execute", _capture_statement)
+    try:
+        result = resolve_authorized_node_ids(session, user, ("document",))
+    finally:
+        event.remove(bind, "before_cursor_execute", _capture_statement)
+
+    assert result is None
+    assert not any("from document_revisions" in sql for sql in statements), statements
+
+
+def test_document_without_revisions_is_not_found(database_session) -> None:
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    session.add(models.Document(id="document", title="document", folder=root))
+    session.flush()
+
+    assert resolve_authorized_node_ids(session, user, ("document",)) is None
+
+
 def test_rejects_document_as_intermediate_and_deleted_nodes(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session)

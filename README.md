@@ -1,13 +1,8 @@
-# CFMS Node Lookup Extension
+# Node Lookup Extension
 
-`node_lookup` adds one authenticated CFMS action that resolves a human-readable
+`node_lookup` is an extension that adds one authenticated CFMS action which resolves a human-readable
 absolute node path to its database ID chain. A result is returned only when the
 caller can read every node in the path, including the root and all ancestors.
-
-Version `0.4.0` targets CFMS server `0.13.0`, protocol 29, and Python 3.15 or
-newer. Its version 2 manifest declares a minimum server version of `0.13.0`.
-The action is `node_lookup.node.resolve`; the legacy `node_lookup` action is
-not registered.
 
 ## Installation
 
@@ -138,6 +133,11 @@ only the terminal ID. Failure entries do not include the submitted path or
 partial IDs. The handler uses the server's normal
 request rate control with a default cost of 3 and does not cache authorization
 results.
+
+Document availability is checked only after the entire path passes authorization.
+The check uses a single database existence query for an active revision instead
+of loading or walking revision history, so a long history cannot amplify one
+lookup into a database query per revision.
 
 ## Performance
 

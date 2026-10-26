@@ -9,11 +9,13 @@ from sqlalchemy.orm import Session as OrmSession
 from include.config.constants import ROOT_DIRECTORY_ID
 from include.database.models.documents import (
     Document,
+    DocumentRevision,
     EntityStatus,
     Folder,
     Node,
     NodeType,
 )
+from include.database.models.files import File
 from include.database.models.identity import User
 from include.domains.access.authorization.compiled_rules import (
     TargetType,
@@ -93,10 +95,6 @@ def _resolve_chain(
     if not all(isinstance(node, Folder) for node in chain[:-1]):
         return None
 
-    terminal = chain[-1]
-    if isinstance(terminal, Document) and not terminal.active:
-        return None
-
     return chain
 
 
@@ -172,5 +170,17 @@ def resolve_authorized_node_ids(
 
     if not _chain_is_readable(session, user, chain):
         return None
+
+    terminal = chain[-1]
+    if isinstance(terminal, Document):
+        # Check existence without walking or materializing the revision history.
+        active_revision = (
+            select(DocumentRevision.id)
+            .join(File, DocumentRevision.file_id == File.id)
+            .where(DocumentRevision.document_id == terminal.id, File.active.is_(True))
+            .exists()
+        )
+        if not session.scalar(select(active_revision)):
+            return None
 
     return tuple(node.id for node in chain)
