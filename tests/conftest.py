@@ -36,21 +36,27 @@ def isolated_server_runtime(server_root: Path, tmp_path_factory):
     shutil.copy(server_root / "src/config.toml.sample", runtime_dir / "config.toml")
     (runtime_dir / "init").touch()
 
-    original_cwd = Path.cwd()
-    server_src = str(server_root / "src")
-    sys.path.insert(0, server_src)
-    os.chdir(runtime_dir)
-    try:
-        yield runtime_dir
-    finally:
-        config_module = sys.modules.get("include.config.settings")
-        if config_module is not None:
-            config_module.global_config.stop()
-        os.chdir(original_cwd)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(server_root / "src"))
+        patch.chdir(runtime_dir)
+
+        from include.config import paths
+
+        # CFMS resolves config and database files from these paths, not cwd.
+        patch.setattr(paths, "EXECUTABLE_ABSPATH", runtime_dir)
+        patch.setattr(paths, "PROJECT_ABSPATH", runtime_dir.parent)
+        patch.setattr(paths, "EXTENSION_ROOT", runtime_dir / "include" / "extensions")
         try:
-            sys.path.remove(server_src)
-        except ValueError:
-            pass
+            yield runtime_dir
+        finally:
+            config_module = sys.modules.get("include.config.settings")
+            database_module = sys.modules.get("include.database.session")
+            try:
+                if config_module is not None:
+                    config_module.global_config.stop()
+            finally:
+                if database_module is not None:
+                    database_module.engine.dispose()
 
 
 @pytest.fixture()
