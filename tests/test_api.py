@@ -1,11 +1,14 @@
 import importlib.util
 import sys
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+
+USER_ID = uuid.UUID("aabbccdd-0000-4000-8000-000000000001")
 
 
 @pytest.fixture(scope="session")
@@ -31,18 +34,14 @@ def extension_module(isolated_server_runtime):
 def _make_user(models, session, username="alice"):
     now = time.time()
     user = models.User(
+        id=USER_ID,
         username=username,
-        pass_hash="hash",
-        passwd_last_modified=now,
         nickname=username,
         avatar_id=None,
         last_login=None,
         created_time=now,
         status=0,
-        secret_key=f"{username}-secret",
-        totp_secret=None,
-        totp_enabled=False,
-        totp_backup_codes=None,
+        secret_key="s" * 64,
         preference_dek_id=None,
     )
     session.add(user)
@@ -54,9 +53,9 @@ def _handler(path: str):
     responses = []
     handler = SimpleNamespace(
         data={"path": path},
-        username="alice",
+        user_id=USER_ID,
         conclude_request=lambda code, data, message: responses.append(
-            {"code": code, "data": data, "message": message}
+            {"code": code, "data": data}
         ),
     )
     return handler, responses
@@ -76,10 +75,11 @@ def test_registers_action_capability_and_transport_contract(extension_module) ->
     from include.transport.request_handler import validate_request_handler_models
 
     handlers = extension_module.ext_register_handlers()
-    handler_type = handlers["node_lookup"]
+    assert set(handlers) == {"node_lookup.node.resolve"}
+    handler_type = handlers["node_lookup.node.resolve"]
 
     assert extension_module.ext_register_extension_flags() == {"node_lookup"}
-    assert handler_type.require_auth is True
+    assert handler_type.requires_auth is True
     assert handler_type.rate_limit_cost == 3
     validate_request_handler_models(handlers)
     assert handler_type.request_model.model_validate({"path": "/projects"}).path == (
@@ -112,19 +112,21 @@ def test_success_returns_rooted_chain_and_audits_only_terminal_id(
     _install_testing_session(monkeypatch, extension_module, session)
 
     handler, responses = _handler("/projects/cfms_on_websocket")
-    result = extension_module.RequestNodeLookupHandler().handle(handler)
+    lookup = extension_module.RequestNodeLookupHandler()
+    request = lookup.request_model.model_validate(handler.data)
+    handler.data["path"] = "/different-raw-path"
+    result = lookup.handle(handler, request)
 
     assert responses == [
         {
             "code": 200,
             "data": {"node_ids": ["/", "projects-id", "repository-id"]},
-            "message": "Node path resolved successfully",
         }
     ]
     assert result.code == 200
     assert result.target == "repository-id"
     assert result.data is None
-    assert result.username == "alice"
+    assert result.user_id == USER_ID
 
 
 def test_root_path_returns_only_the_root_id(
@@ -136,7 +138,8 @@ def test_root_path_returns_only_the_root_id(
     _install_testing_session(monkeypatch, extension_module, session)
 
     handler, responses = _handler("/")
-    result = extension_module.RequestNodeLookupHandler().handle(handler)
+    lookup = extension_module.RequestNodeLookupHandler()
+    result = lookup.handle(handler, lookup.request_model.model_validate(handler.data))
 
     assert responses[0]["data"] == {"node_ids": ["/"]}
     assert result.target == "/"
@@ -175,11 +178,16 @@ def test_hidden_and_missing_paths_have_identical_empty_responses(
     _install_testing_session(monkeypatch, extension_module, session)
 
     hidden_handler, hidden_responses = _handler("/hidden")
-    hidden_result = extension_module.RequestNodeLookupHandler().handle(hidden_handler)
+    lookup = extension_module.RequestNodeLookupHandler()
+    hidden_result = lookup.handle(
+        hidden_handler, lookup.request_model.model_validate(hidden_handler.data)
+    )
     missing_handler, missing_responses = _handler("/missing")
-    missing_result = extension_module.RequestNodeLookupHandler().handle(missing_handler)
+    missing_result = lookup.handle(
+        missing_handler, lookup.request_model.model_validate(missing_handler.data)
+    )
 
-    expected = [{"code": 404, "data": {}, "message": "Node path not found"}]
+    expected = [{"code": 404, "data": {}}]
     assert hidden_responses == expected
     assert missing_responses == expected
     assert hidden_result.code == missing_result.code == 404
@@ -187,6 +195,7 @@ def test_hidden_and_missing_paths_have_identical_empty_responses(
     assert missing_result.target is None
     assert hidden_result.data is None
     assert missing_result.data is None
+    assert hidden_result.user_id == missing_result.user_id == USER_ID
 
 
 def test_invalid_path_is_rejected_without_database_lookup(
@@ -198,8 +207,180 @@ def test_invalid_path_is_rejected_without_database_lookup(
     monkeypatch.setattr(extension_module, "Session", _unexpected_session)
     handler, responses = _handler("relative/path")
 
-    result = extension_module.RequestNodeLookupHandler().handle(handler)
+    lookup = extension_module.RequestNodeLookupHandler()
+    result = lookup.handle(handler, lookup.request_model.model_validate(handler.data))
 
-    assert responses == [{"code": 400, "data": {}, "message": "Invalid node path"}]
+    assert responses == [{"code": 400, "data": {}}]
     assert result.code == 400
     assert result.target is None
+    assert result.user_id == USER_ID
+
+
+@pytest.fixture()
+def routed_lookup(monkeypatch, extension_module, database_session):
+    import orjson
+    from sqlalchemy.orm import sessionmaker
+
+    from include.domains.identity.tokens import Token, TokenPurpose
+    from include.transport import router
+    from include.transport.multiplexing import FrameType
+
+    models, session = database_session
+    user = _make_user(models, session)
+    session.commit()
+    _install_testing_session(monkeypatch, extension_module, session)
+    monkeypatch.setattr(router, "Session", sessionmaker(bind=session.get_bind()))
+    monkeypatch.setattr(
+        router, "available_functions", extension_module.ext_register_handlers()
+    )
+    monkeypatch.setattr(
+        router.LoginGuard,
+        "evaluate_subnet_access",
+        lambda _ip: SimpleNamespace(allowed=True),
+    )
+    rate_calls = []
+
+    def allow_rate(action, cost, _ip, **kwargs):
+        rate_calls.append((action, cost, kwargs))
+        return SimpleNamespace(allowed=True)
+
+    monkeypatch.setattr(router, "check_request_rate", allow_rate)
+    monkeypatch.setattr(
+        router.lockdown_state_manager,
+        "get_state",
+        lambda: SimpleNamespace(enabled=False),
+    )
+    monkeypatch.setattr(
+        router.nonce_store, "validate_and_store", lambda _nonce, _timestamp: None
+    )
+    dispatched = []
+
+    def before_request(*, request_handler, connection_handler):
+        dispatched.append(connection_handler.user_id)
+
+    monkeypatch.setattr(
+        router,
+        "pm",
+        SimpleNamespace(
+            hook=SimpleNamespace(
+                ext_before_request=before_request,
+                ext_post_request=lambda **_kwargs: None,
+            )
+        ),
+    )
+    audits = []
+    monkeypatch.setattr(
+        router,
+        "log_audit",
+        lambda action, code, **kwargs: audits.append(
+            {"action": action, "code": code, **kwargs}
+        ),
+    )
+
+    def send(data, *, token="GENERAL", action="node_lookup.node.resolve", **envelope):
+        request = {
+            "action": action,
+            "data": data,
+            "nonce": uuid.uuid4().hex,
+            "timestamp": time.time(),
+            **envelope,
+        }
+        if token == "invalid":
+            request["token"] = "invalid-token"
+        elif token is not None:
+            request["token"] = Token.new(
+                user.id, 60, user.secret_key, purpose=TokenPurpose[token]
+            ).raw
+        frames = []
+        websocket = SimpleNamespace(
+            remote_address=("192.0.2.10", 12345),
+            request=SimpleNamespace(headers={}),
+        )
+        stream = SimpleNamespace(
+            connection=SimpleNamespace(_ws=websocket),
+            recv=lambda: SimpleNamespace(data=orjson.dumps(request)),
+            send=lambda data, frame_type: frames.append((data, frame_type)),
+        )
+        router.handle_request(stream)
+        assert len(frames) == 1
+        payload, frame_type = frames[0]
+        assert frame_type is FrameType.CONCLUSION
+        return orjson.loads(payload)
+
+    return SimpleNamespace(
+        send=send,
+        user=user,
+        session=session,
+        audits=audits,
+        dispatched=dispatched,
+        rate_calls=rate_calls,
+    )
+
+
+def test_router_dispatches_with_token_uuid_after_user_rename(routed_lookup) -> None:
+    routed_lookup.user.username = "renamed-alice"
+    routed_lookup.session.commit()
+
+    response = routed_lookup.send({"path": "/"}, username="unrelated-account")
+
+    assert response["code"] == 200, response
+    assert response["data"] == {"node_ids": ["/"]}
+    assert routed_lookup.dispatched == [USER_ID]
+    assert len(routed_lookup.audits) == 1
+    audit = routed_lookup.audits[0]
+    assert audit["action"] == "node_lookup.node.resolve"
+    assert audit["user_id"] == USER_ID
+    assert audit["target"] == "/"
+    assert audit["data"] is None
+    action, cost, context = routed_lookup.rate_calls[0]
+    assert action == "node_lookup.node.resolve"
+    assert cost == 3
+    assert context["user_id"] == USER_ID
+
+
+@pytest.mark.parametrize(
+    ("token", "expected_code"),
+    [(None, 401), ("invalid", 401), ("ESCALATION", 403)],
+)
+def test_router_enforces_authentication_and_token_purpose(
+    routed_lookup, token, expected_code
+) -> None:
+    response = routed_lookup.send({"path": "/"}, token=token)
+
+    assert response["code"] == expected_code, response
+    assert response["data"] == {}
+    assert routed_lookup.dispatched == []
+    if token == "ESCALATION":
+        assert routed_lookup.audits[0]["user_id"] == USER_ID
+
+
+@pytest.mark.parametrize(
+    ("data", "error_type", "location"),
+    [
+        ({}, "missing", ["path"]),
+        ({"path": None}, "string_type", ["path"]),
+        ({"path": 1}, "string_type", ["path"]),
+        ({"path": ""}, "string_too_short", ["path"]),
+        ({"path": "/" + "a" * 4096}, "string_too_long", ["path"]),
+        ({"path": "/", "extra": True}, "extra_forbidden", ["extra"]),
+    ],
+)
+def test_router_rejects_invalid_data_before_dispatch(
+    routed_lookup, data, error_type, location
+) -> None:
+    response = routed_lookup.send(data)
+
+    assert response["code"] == 400, response
+    assert [
+        (error["type"], error["loc"]) for error in response["data"]["errors"]
+    ] == [(error_type, location)]
+    assert all("input" not in error for error in response["data"]["errors"])
+    assert routed_lookup.dispatched == []
+
+
+def test_router_does_not_register_legacy_action(routed_lookup) -> None:
+    response = routed_lookup.send({"path": "/"}, action="node_lookup")
+
+    assert response["code"] == 400, response
+    assert response["data"] == {}
+    assert routed_lookup.dispatched == []

@@ -57,13 +57,13 @@ def _build_path_query(segments: Sequence[str]):
         .select_from(
             path.join(
                 child,
-                child.c.active_parent_id == path.c.id,
+                child.c.parent_id == path.c.id,
             )
         )
         .where(
             path.c.type == NodeType.DIRECTORY.value,
             path.c.depth < len(segments),
-            child.c.name == expected_name,
+            child.c.active_name == expected_name,
         )
     )
     return (

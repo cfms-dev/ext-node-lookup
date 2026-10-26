@@ -18,11 +18,11 @@ jobs:
         with:
           path: ext_node_lookup
 
-      - name: Check out CFMS server (baseline)
+      - name: Check out CFMS server (0.13.0 baseline)
         uses: actions/checkout@v7
         with:
           repository: cfms-dev/cfms_on_websocket
-          ref: v0.11.1
+          ref: v0.13.0
           path: cfms_on_websocket
 
       - name: Set up Python 3.15

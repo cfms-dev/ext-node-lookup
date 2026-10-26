@@ -16,17 +16,12 @@ def _make_user(models, session, *, username="alice", groups=()):
     now = time.time()
     user = models.User(
         username=username,
-        pass_hash="hash",
-        passwd_last_modified=now,
         nickname=username,
         avatar_id=None,
         last_login=None,
         created_time=now,
         status=0,
         secret_key=f"{username}-secret",
-        totp_secret=None,
-        totp_enabled=False,
-        totp_backup_codes=None,
         preference_dek_id=None,
     )
     for group_name in groups:
@@ -39,7 +34,6 @@ def _make_user(models, session, *, username="alice", groups=()):
             )
         user.groups.append(
             models.UserMembership(
-                username=username,
                 group_name=group_name,
                 start_time=0.0,
                 end_time=None,
@@ -105,7 +99,7 @@ def _grant_read(models, session, user, target, target_type):
     session.add(
         models.ObjectAccessEntry(
             entity_type="user",
-            entity_identifier=user.username,
+            entity_identifier=str(user.id),
             target_type=target_type,
             target_identifier=target.id,
             access_type="read",
@@ -118,7 +112,7 @@ def _grant_read(models, session, user, target, target_type):
 
 def _block_read(models, session, user, *, target_type, target_id=None):
     entry = models.UserBlockEntry(
-        username=user.username,
+        user_id=user.id,
         timestamp=time.time(),
         not_before=0.0,
         not_after=-1,
@@ -199,6 +193,40 @@ def test_rejects_document_as_intermediate_and_deleted_nodes(database_session) ->
     assert resolve_authorized_node_ids(session, user, ("document", "child")) is None
     assert resolve_authorized_node_ids(session, user, ("deleted",)) is None
     assert resolve_authorized_node_ids(session, user, ("missing",)) is None
+
+
+def test_deleted_names_do_not_shadow_live_nodes_or_allow_traversal(
+    database_session,
+) -> None:
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    deleted = _add_folder(models, session, "deleted", "shared", root)
+    deleted.status = models.EntityStatus.DELETED
+    session.flush()
+    _add_folder(models, session, "hidden-child", "child", deleted)
+    _add_folder(models, session, "live", "shared", root)
+
+    assert resolve_authorized_node_ids(session, user, ("shared",)) == ("/", "live")
+    assert resolve_authorized_node_ids(session, user, ("shared", "child")) is None
+
+
+def test_direct_uuid_grant_survives_user_rename(database_session) -> None:
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    folder = _add_folder(models, session, "folder", "folder", root)
+    _deny_read(models, folder, session)
+    _grant_read(models, session, user, folder, "directory")
+    session.commit()
+    original_id = user.id
+
+    user.username = "renamed-alice"
+    session.commit()
+    session.expire_all()
+
+    assert user.id == original_id
+    assert resolve_authorized_node_ids(session, user, ("folder",)) == ("/", "folder")
 
 
 @pytest.mark.parametrize("hidden_level", ["root", "ancestor", "terminal"])
@@ -291,13 +319,13 @@ def test_group_oae_can_authorize_a_visible_terminal(database_session) -> None:
     )
 
 
-def test_group_oae_does_not_match_a_same_named_user(database_session) -> None:
+def test_group_oae_does_not_match_a_user_uuid(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session, username="shared-name")
     session.add(
         models.UserGroup(
-            group_name="shared-name",
-            group_display_name="shared-name",
+            group_name=str(user.id),
+            group_display_name="same identifier as the user",
         )
     )
     root = session.get(models.Folder, "/")
@@ -306,7 +334,7 @@ def test_group_oae_does_not_match_a_same_named_user(database_session) -> None:
     session.add(
         models.ObjectAccessEntry(
             entity_type="group",
-            entity_identifier="shared-name",
+            entity_identifier=str(user.id),
             target_type="directory",
             target_identifier=folder.id,
             access_type="read",
@@ -319,17 +347,17 @@ def test_group_oae_does_not_match_a_same_named_user(database_session) -> None:
     assert resolve_authorized_node_ids(session, user, ("folder",)) is None
 
 
-def test_user_oae_does_not_match_a_same_named_group(database_session) -> None:
+def test_user_oae_does_not_match_a_group_with_the_same_identifier(database_session) -> None:
     models, session = database_session
-    _make_user(models, session, username="shared-name")
-    user = _make_user(models, session, username="alice", groups=("shared-name",))
+    other_user = _make_user(models, session, username="shared-name")
+    user = _make_user(models, session, username="alice", groups=(str(other_user.id),))
     root = session.get(models.Folder, "/")
     folder = _add_folder(models, session, "folder", "folder", root)
     _deny_read(models, folder, session)
     session.add(
         models.ObjectAccessEntry(
             entity_type="user",
-            entity_identifier="shared-name",
+            entity_identifier=str(other_user.id),
             target_type="directory",
             target_identifier=folder.id,
             access_type="read",
@@ -359,7 +387,7 @@ def test_group_oae_requires_an_active_membership(
         )
     )
     membership = models.UserMembership(
-        username=user.username,
+        user_id=user.id,
         group_name="readers",
         start_time=membership_start,
         end_time=None,
@@ -460,8 +488,8 @@ def test_recursive_path_query_compiles_for_supported_dialects(dialect_name) -> N
     )
 
     assert "WITH RECURSIVE" in sql.upper()
-    assert "active_parent_id" in sql
-    assert "node_lookup_child.name" in sql
+    assert "node_lookup_child.parent_id" in sql
+    assert "node_lookup_child.active_name" in sql
 
 
 def test_recursive_path_query_uses_active_parent_name_index(database_session) -> None:
@@ -475,4 +503,4 @@ def test_recursive_path_query_uses_active_parent_name_index(database_session) ->
     )
     plan = session.execute(text(f"EXPLAIN QUERY PLAN {statement}")).all()
 
-    assert any("active_parent_id=? AND name=?" in detail for *_, detail in plan), plan
+    assert any("parent_id=? AND active_name=?" in detail for *_, detail in plan), plan

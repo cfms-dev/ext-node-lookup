@@ -4,9 +4,10 @@
 absolute node path to its database ID chain. A result is returned only when the
 caller can read every node in the path, including the root and all ancestors.
 
-Version `0.3.1` targets CFMS server `0.5.0.260820_alpha` or newer, protocol
-22. Its version 2 manifest lets the server reject incompatible installations
-before importing the extension.
+Version `0.4.0` targets CFMS server `0.13.0`, protocol 29, and Python 3.15 or
+newer. Its version 2 manifest declares a minimum server version of `0.13.0`.
+The action is `node_lookup.node.resolve`; the legacy `node_lookup` action is
+not registered.
 
 ## Installation
 
@@ -18,8 +19,19 @@ You may verify the downloaded archive with the accompanying `SHA256SUMS.txt`:
 sha256sum --check --ignore-missing SHA256SUMS.txt
 ```
 
-Extract the archive directly into the server extension catalog. For example,
-on Linux:
+Install the ZIP with the server's maintenance command, run from the server tree:
+
+```bash
+maintain extension install /absolute/path/node_lookup-X.Y.Z.zip --sha256 <digest>
+maintain extension enable node_lookup
+```
+
+Use `maintain extension upgrade` instead of `install` for an existing installation.
+Restart the server after enabling or upgrading the extension. The ZIP contains
+`manifest.toml` and `_extension.py` directly at its root.
+
+Alternatively, extract the tar.gz archive, which includes a `node_lookup/`
+directory, directly into the server extension catalog. For example, on Linux:
 
 ```bash
 tar -xzf node_lookup-X.Y.Z.tar.gz \
@@ -53,8 +65,7 @@ Send an authenticated request with a replay-protection nonce and timestamp:
 
 ```json
 {
-  "action": "node_lookup",
-  "username": "alice",
+  "action": "node_lookup.node.resolve",
   "token": "<token>",
   "nonce": "<at-least-16-characters>",
   "timestamp": 1786200000,
@@ -63,6 +74,11 @@ Send an authenticated request with a replay-protection nonce and timestamp:
   }
 }
 ```
+
+Use a current timestamp and a fresh nonce for each request. The server derives the
+user UUID from the verified token; no envelope username is needed. The token must
+include the `GENERAL` purpose. Missing or invalid tokens return `401`; valid
+tokens without the required purpose return `403`.
 
 A successful lookup includes the root ID:
 
@@ -117,8 +133,9 @@ paths all produce the same response, without a visible prefix:
 }
 ```
 
-Successful audit entries target only the terminal ID. Failure entries do not
-include the submitted path or partial IDs. The handler uses the server's normal
+Audit entries identify the caller by UUID (`user_id`). Successful entries target
+only the terminal ID. Failure entries do not include the submitted path or
+partial IDs. The handler uses the server's normal
 request rate control with a default cost of 3 and does not cache authorization
 results.
 
@@ -126,15 +143,15 @@ results.
 
 For non-root paths, the resolver uses one recursive database query for the
 complete path. Each recursive step joins through the server's existing active
-`parent + name` index, so sibling count does not require a linear scan. Access
-rules, object grants, and user blocks are then loaded in batches and evaluated
+`parent_id + active_name` index, so sibling count does not require a linear scan.
+Access rules, object grants, and user blocks are then loaded in batches and evaluated
 once over the returned chain.
 
 Database round trips therefore remain constant as path depth grows; only the
 number of rows and in-process authorization checks grows linearly. The test
 suite enforces a fixed query budget at the maximum supported depth and verifies
-the SQLite index plan as well as SQLite and MySQL query compilation. Results are
-intentionally not cached, because doing so could expose stale authorization or
+the SQLite index plan as well as SQLite, PostgreSQL, and MySQL query compilation.
+Results are intentionally not cached, because doing so could expose stale authorization or
 rename/move state.
 
 ## Testing
@@ -144,5 +161,10 @@ and never use the server's `app.db`:
 
 ```powershell
 $env:CFMS_SERVER_ROOT = "D:\projects\cfms_on_websocket"
-uv run --project $env:CFMS_SERVER_ROOT pytest tests -v
+uv run --no-sync --project $env:CFMS_SERVER_ROOT pytest tests -v
 ```
+
+CI and release validation use CFMS commit ref
+`v0.13.0` (0.13.0). Install that checkout's
+development dependencies with `uv sync --project <server-root> --dev --all-extras`
+before running tests locally.

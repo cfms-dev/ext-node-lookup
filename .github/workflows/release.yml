@@ -42,11 +42,11 @@ jobs:
           ref: ${{ steps.release.outputs.tag }}
           path: ext_node_lookup
 
-      - name: Check out CFMS server (baseline)
+      - name: Check out CFMS server (0.13.0 baseline)
         uses: actions/checkout@v7
         with:
           repository: cfms-dev/cfms_on_websocket
-          ref: v0.11.1
+          ref: v0.13.0
           path: cfms_on_websocket
 
       - name: Set up Python 3.15
@@ -103,7 +103,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: cfms-dev/cfms_on_websocket
-          ref: dev
+          ref: v0.13.0
           path: cfms_on_websocket
 
       - name: Set up Python 3.15
@@ -157,25 +157,21 @@ jobs:
 
           with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
               for filename in archive_files:
-                  archive.write(package_root / filename, f"node_lookup/{filename}")
+                  archive.write(package_root / filename, filename)
 
           with tarfile.open(tar_path, "w:gz") as archive:
               for filename in archive_files:
                   archive.add(package_root / filename, arcname=f"node_lookup/{filename}")
 
-          expected = {
-              f"node_lookup/{filename}"
-              for filename in archive_files
-          }
           with zipfile.ZipFile(zip_path) as archive:
               zip_files = {item.filename for item in archive.infolist() if not item.is_dir()}
-              if zip_files != expected:
+              if zip_files != set(archive_files):
                   raise SystemExit(f"unexpected ZIP contents: {sorted(zip_files)}")
-              archive.extractall(dist / "verification" / "zip")
+              archive.extractall(dist / "verification" / "zip" / "node_lookup")
 
           with tarfile.open(tar_path, "r:gz") as archive:
               tar_files = {item.name for item in archive.getmembers() if item.isfile()}
-              if tar_files != expected:
+              if tar_files != {f"node_lookup/{filename}" for filename in archive_files}:
                   raise SystemExit(f"unexpected tar.gz contents: {sorted(tar_files)}")
               archive.extractall(dist / "verification" / "tar")
 
@@ -189,14 +185,19 @@ jobs:
           )
           PY
 
-      - name: Verify packages with the server extension loader
+      - name: Verify package discovery and ZIP installation
         env:
           PYTHONPATH: ${{ github.workspace }}/cfms_on_websocket/src
           RELEASE_VERSION: ${{ needs.validate-and-test.outputs.version }}
         run: |
           uv run --project cfms_on_websocket python - <<'PY'
+          import hashlib
           import os
+          import shutil
+          import subprocess
+          import sys
           from pathlib import Path
+          from tempfile import TemporaryDirectory
 
           from include.extensions.manager import discover_extensions
 
@@ -215,6 +216,38 @@ jobs:
                       f"{archive_type} package version {actual_version!r} does not "
                       f"match {expected_version!r}"
                   )
+
+          package_path = Path(f"dist/node_lookup-{expected_version}.zip").resolve()
+          digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
+          sample_config = Path("cfms_on_websocket/src/config.toml.sample").resolve()
+          with TemporaryDirectory(prefix="node-lookup-install-") as temporary:
+              runtime = Path(temporary) / "src"
+              extension_root = runtime / "include" / "extensions"
+              extension_root.mkdir(parents=True)
+              (runtime / "main.py").touch()
+              (runtime / "init").touch()
+              shutil.copyfile(sample_config, runtime / "config.toml")
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "-c",
+                      "from maintenance.cli import app; app()",
+                      "extension", "install", str(package_path),
+                      "--sha256", digest, "--yes",
+                  ],
+                  cwd=runtime,
+                  check=True,
+              )
+              installed = discover_extensions(extension_root)
+              if set(installed) != {"node_lookup"}:
+                  raise SystemExit("ZIP installation did not create node_lookup")
+              if installed["node_lookup"].manifest.extension.version != expected_version:
+                  raise SystemExit("ZIP installation returned an unexpected version")
+              extracted = Path("dist/verification/zip/node_lookup")
+              for source in extracted.iterdir():
+                  target = extension_root / "node_lookup" / source.name
+                  if target.read_bytes() != source.read_bytes():
+                      raise SystemExit(f"Installed ZIP content differs: {source.name}")
           PY
 
       - name: Upload release packages

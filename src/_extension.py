@@ -18,25 +18,25 @@ class _NodeLookupRequest(RequestDataModel):
     path: Annotated[str, Field(min_length=1, max_length=MAX_PATH_LENGTH)]
 
 
-class RequestNodeLookupHandler(RequestHandler):
+class RequestNodeLookupHandler(RequestHandler[_NodeLookupRequest]):
     request_model = _NodeLookupRequest
-    require_auth = True
+    requires_auth = True
     rate_limit_cost = 3
 
-    def handle(self, handler: ConnectionHandler) -> Result:
+    def handle(self, handler: ConnectionHandler, request) -> Result:
         try:
-            segments = parse_node_path(handler.data["path"])
+            segments = parse_node_path(request.path)
         except NodePathError:
             handler.conclude_request(400, {}, "Invalid node path")
-            return Result(code=400, target=None, username=handler.username)
+            return Result(code=400, target=None, user_id=handler.user_id)
 
         with Session() as session:
-            user = User.get_existing(session, handler.username)
+            user = User.get_existing(session, handler.user_id)
             node_ids = resolve_authorized_node_ids(session, user, segments)
 
         if node_ids is None:
             handler.conclude_request(404, {}, "Node path not found")
-            return Result(code=404, target=None, username=handler.username)
+            return Result(code=404, target=None, user_id=handler.user_id)
 
         response_data = {"node_ids": list(node_ids)}
         handler.conclude_request(
@@ -44,12 +44,12 @@ class RequestNodeLookupHandler(RequestHandler):
             response_data,
             "Node path resolved successfully",
         )
-        return Result(code=200, target=node_ids[-1], username=handler.username)
+        return Result(code=200, target=node_ids[-1], user_id=handler.user_id)
 
 
 @hookimpl
 def ext_register_handlers() -> dict[str, type[RequestHandler]]:
-    return {"node_lookup": RequestNodeLookupHandler}
+    return {"node_lookup.node.resolve": RequestNodeLookupHandler}
 
 
 @hookimpl
