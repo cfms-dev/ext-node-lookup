@@ -148,7 +148,10 @@ def test_root_path_returns_only_the_root_id(
 def test_hidden_and_missing_paths_have_identical_empty_responses(
     monkeypatch, extension_module, database_session
 ) -> None:
-    from include.domains.access.authorization.access_rules import set_access_rules
+    from include.domains.access.authorization.storage import (
+        compile_policy_source,
+        persist_node_policy,
+    )
 
     models, session = database_session
     _make_user(models, session)
@@ -156,24 +159,9 @@ def test_hidden_and_missing_paths_have_identical_empty_responses(
     hidden = models.Folder(id="hidden-id", name="hidden", parent=root)
     session.add(hidden)
     session.flush()
-    set_access_rules(
-        hidden,
-        {
-            "read": [
-                {
-                    "match": "all",
-                    "match_groups": [
-                        {
-                            "rights": {
-                                "match": "all",
-                                "require": ["secret"],
-                            }
-                        }
-                    ],
-                }
-            ]
-        },
-    )
+    compiled = compile_policy_source(session, "inherit off;")
+    assert compiled.policy is not None
+    persist_node_policy(session, hidden, compiled.policy)
     session.commit()
     _install_testing_session(monkeypatch, extension_module, session)
 

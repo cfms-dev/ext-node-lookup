@@ -1,7 +1,9 @@
 """Database-backed, permission-safe node path resolution."""
 
-import time
+import datetime
 from collections.abc import Sequence
+
+from cacl_compiler import CompiledPolicy
 
 from sqlalchemy import case, literal, select
 from sqlalchemy.orm import Session as OrmSession
@@ -17,15 +19,19 @@ from include.database.models.documents import (
 )
 from include.database.models.files import File
 from include.database.models.identity import User
-from include.domains.access.authorization.compiled_rules import (
-    TargetType,
-    compiled_rules_allow_from_map,
-    fetch_compiled_access_rules_for_targets,
+from include.domains.access.authorization.engine import (
+    NamespaceNode,
+    evaluate_effective_masks,
+    is_effective_mask_visible,
 )
-from include.domains.access.authorization.grants import (
-    batch_prefetch_granted_ids,
-    prefetch_user_blocks,
+from include.domains.access.authorization.evaluation import (
+    has_bypass_dacl,
+    node_to_object_state,
+    node_to_object_type,
+    should_check_ancestor_traverse,
+    user_to_subject,
 )
+from include.domains.access.authorization.storage import load_node_policies
 
 __all__ = ["resolve_authorized_node_ids"]
 
@@ -98,64 +104,44 @@ def _resolve_chain(
     return chain
 
 
-def _target_type(node: Folder | Document) -> TargetType:
-    return "document" if isinstance(node, Document) else "directory"
-
-
-def _chain_is_readable(
+def _chain_is_authorized(
     session: OrmSession,
     user: User,
     chain: Sequence[Folder | Document],
 ) -> bool:
-    now = time.time()
-    is_globally_blocked, blocked_ids = prefetch_user_blocks(
+    if has_bypass_dacl(user):
+        return True
+
+    now = datetime.datetime.now(datetime.UTC)
+    preloaded_inherit = {node.id: bool(node.inherit) for node in chain}
+    policies = load_node_policies(
         session,
-        user,
-        "read",
-        now,
+        [node.id for node in chain],
+        preloaded_inherit=preloaded_inherit,
+        active_at_utc=now,
+        canonicalize=False,
     )
-    if is_globally_blocked:
-        return False
-
-    targets = [(_target_type(node), node.id) for node in chain]
-    compiled_rules = fetch_compiled_access_rules_for_targets(
-        session,
-        targets,
-        access_type="read",
+    path = [
+        NamespaceNode(
+            node_id=node.id,
+            name=node.name,
+            object_type=node_to_object_type(node),
+            state=node_to_object_state(node),
+            policy=policies.get(
+                node.id, CompiledPolicy(inherit=bool(node.inherit), rules=())
+            ),
+        )
+        for node in chain
+    ]
+    masks = evaluate_effective_masks(
+        user_to_subject(user),
+        path,
+        eval_time_utc=now,
+        check_ancestor_traverse=should_check_ancestor_traverse(session, user),
     )
-
-    granted_ids_by_type: dict[TargetType, set[str]] = {}
-    for target_type in ("directory", "document"):
-        target_ids = [
-            target_id
-            for this_type, target_id in targets
-            if this_type == target_type
-        ]
-        if target_ids:
-            granted_ids_by_type[target_type] = batch_prefetch_granted_ids(
-                session,
-                user,
-                target_ids,
-                target_type,
-                "read",
-                now,
-            )
-
-    for node in chain:
-        if node.id in blocked_ids:
-            return False
-        target_type = _target_type(node)
-        if node.id in granted_ids_by_type.get(target_type, set()):
-            continue
-        if not compiled_rules_allow_from_map(
-            compiled_rules,
-            target_type=target_type,
-            target_id=node.id,
-            user=user,
-            access_type="read",
-        ):
-            return False
-    return True
+    return masks.allowed_traverse and is_effective_mask_visible(
+        path[-1].object_type, masks.effective_mask
+    )
 
 
 def resolve_authorized_node_ids(
@@ -168,7 +154,7 @@ def resolve_authorized_node_ids(
     if chain is None:
         return None
 
-    if not _chain_is_readable(session, user, chain):
+    if not _chain_is_authorized(session, user, chain):
         return None
 
     terminal = chain[-1]

@@ -14,14 +14,14 @@ You may verify the downloaded archive with the accompanying `SHA256SUMS.txt`:
 sha256sum --check --ignore-missing SHA256SUMS.txt
 ```
 
-Install the ZIP with the server's maintenance command, run from the server tree:
+Install the ZIP with the server's maintenance command (`cfms-ctl`), run from the server tree:
 
 ```bash
-maintain extension install /absolute/path/node_lookup-X.Y.Z.zip --sha256 <digest>
-maintain extension enable node_lookup
+cfms-ctl extension install /absolute/path/node_lookup-X.Y.Z.zip --sha256 <digest>
+cfms-ctl extension enable node_lookup
 ```
 
-Use `maintain extension upgrade` instead of `install` for an existing installation.
+Use `cfms-ctl extension upgrade` instead of `install` for an existing installation.
 Restart the server after enabling or upgrading the extension. The ZIP contains
 `manifest.toml` and `_extension.py` directly at its root.
 
@@ -110,12 +110,20 @@ For example, `/teams%2Fsecurity/100%25` addresses the two node names
 ## Security behavior
 
 Authentication alone permits invoking the action; no `search` permission is
-required. Existing read rules, inheritance, direct and group object access
-entries, and user blocks are evaluated for every node. User and group grants
-remain in separate principal namespaces, and group grants apply only through a
-currently active membership. A direct grant on the terminal node never makes
-hidden ancestors visible, and
-`super_list_directory` is not treated as an implicit bypass.
+required. The resolver evaluates the server's CACL (CEP-0002) DACL chain over
+every node from `/` to the target:
+
+- inheritance (`inherit on | off`), scopes (`self`, `dirs`, `docs`, `all`),
+  half-open UTC validity windows, and explicit `deny` overrides;
+- user, group, and global-permission principal namespaces remain separate, and
+  group predicates apply only through currently active memberships;
+- every normal ancestor directory must permit `TRAVERSE` unless the caller
+  holds `bypass_traverse_checking`, the `access.bypass_traverse_checking`
+  option is enabled, or the caller holds global `bypass_dacl`;
+- the terminal node must be visible to the caller (`LIST_DIRECTORY` or
+  `READ_METADATA` for a directory; `READ_CONTENT` or `READ_METADATA` for a
+  document). A direct allow on the terminal node never reveals an ancestor that
+  blocks traversal.
 
 Missing, deleted, inaccessible, structurally invalid, and unpublished document
 paths all produce the same response, without a visible prefix:
@@ -144,7 +152,7 @@ lookup into a database query per revision.
 For non-root paths, the resolver uses one recursive database query for the
 complete path. Each recursive step joins through the server's existing active
 `parent_id + active_name` index, so sibling count does not require a linear scan.
-Access rules, object grants, and user blocks are then loaded in batches and evaluated
+Active CACL DACL policies are then batch-loaded in a single query and evaluated
 once over the returned chain.
 
 Database round trips therefore remain constant as path depth grows; only the
@@ -165,6 +173,6 @@ uv run --no-sync --project $env:CFMS_SERVER_ROOT pytest tests -v
 ```
 
 CI and release validation use CFMS commit ref
-`v0.13.0` (0.13.0). Install that checkout's
+`v0.15.0` (0.15.0). Install that checkout's
 development dependencies with `uv sync --project <server-root> --dev --all-extras`
 before running tests locally.

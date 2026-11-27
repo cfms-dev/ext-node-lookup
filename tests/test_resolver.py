@@ -1,3 +1,4 @@
+import datetime
 import time
 
 import pytest
@@ -12,7 +13,14 @@ def _load_resolver_after_runtime_setup():
     from _resolver import _build_path_query, resolve_authorized_node_ids
 
 
-def _make_user(models, session, *, username="alice", groups=()):
+def _make_user(
+    models,
+    session,
+    *,
+    username="alice",
+    groups=(),
+    permissions=(),
+):
     now = time.time()
     user = models.User(
         username=username,
@@ -24,6 +32,16 @@ def _make_user(models, session, *, username="alice", groups=()):
         secret_key=f"{username}-secret",
         preference_dek_id=None,
     )
+    for permission in permissions:
+        user.rights.append(
+            models.UserPermission(
+                user=user,
+                permission=permission,
+                granted=True,
+                start_time=0.0,
+                end_time=None,
+            )
+        )
     for group_name in groups:
         if session.get(models.UserGroup, group_name) is None:
             session.add(
@@ -42,6 +60,20 @@ def _make_user(models, session, *, username="alice", groups=()):
     session.add(user)
     session.flush()
     return user
+
+
+def _grant_permission(models, session, user, permission: str) -> None:
+    user.rights.append(
+        models.UserPermission(
+            user=user,
+            permission=permission,
+            granted=True,
+            start_time=0.0,
+            end_time=None,
+        )
+    )
+    user.__dict__.pop("all_permissions", None)
+    session.flush()
 
 
 def _add_folder(models, session, node_id, name, parent, **kwargs):
@@ -70,57 +102,33 @@ def _add_document(models, session, node_id, title, parent, *, active=True):
     return document
 
 
-def _deny_read(models, target, session, *, required_permission="hidden"):
-    from include.domains.access.authorization.access_rules import set_access_rules
-
-    set_access_rules(
-        target,
-        {
-            "read": [
-                {
-                    "match": "all",
-                    "match_groups": [
-                        {
-                            "rights": {
-                                "match": "all",
-                                "require": [required_permission],
-                            }
-                        }
-                    ],
-                }
-            ]
-        },
-        inherit_parent=target.inherit,
+def _set_dacl(session, target, source: str, *, now_utc=None) -> None:
+    from include.domains.access.authorization.storage import (
+        compile_policy_source,
+        persist_node_policy,
     )
+
+    compiled = compile_policy_source(session, source, now_utc=now_utc)
+    assert not compiled.errors, compiled.diagnostics
+    assert compiled.policy is not None
+    persist_node_policy(session, target, compiled.policy)
     session.flush()
 
 
-def _grant_read(models, session, user, target, target_type):
-    session.add(
-        models.ObjectAccessEntry(
-            entity_type="user",
-            entity_identifier=str(user.id),
-            target_type=target_type,
-            target_identifier=target.id,
-            access_type="read",
-            start_time=0.0,
-            end_time=None,
-        )
+def _set_bypass_traverse_option(session, enabled: bool) -> None:
+    from include.config.options import (
+        BYPASS_TRAVERSE_CHECKING_OPTION,
+        read_option,
+        write_options,
     )
-    session.flush()
 
-
-def _block_read(models, session, user, *, target_type, target_id=None):
-    entry = models.UserBlockEntry(
-        user_id=user.id,
-        timestamp=time.time(),
-        not_before=0.0,
-        not_after=-1,
-        target_type=target_type,
-        target_id=target_id,
+    current = read_option(session, "access", BYPASS_TRAVERSE_CHECKING_OPTION)
+    write_options(
+        session,
+        "access",
+        {"bypass_traverse_checking": enabled},
+        expected_revisions={"bypass_traverse_checking": current.revision},
     )
-    entry.sub_entries.append(models.UserBlockSubEntry(block_type="read"))
-    session.add(entry)
     session.flush()
 
 
@@ -237,7 +245,7 @@ def test_hidden_document_does_not_load_revision_history(database_session) -> Non
     user = _make_user(models, session)
     root = session.get(models.Folder, "/")
     document = _add_document(models, session, "document", "document", root)
-    _deny_read(models, document, session)
+    _set_dacl(session, document, "inherit off;")
     session.commit()
     session.expire_all()
     statements = []
@@ -301,8 +309,11 @@ def test_direct_uuid_grant_survives_user_rename(database_session) -> None:
     user = _make_user(models, session)
     root = session.get(models.Folder, "/")
     folder = _add_folder(models, session, "folder", "folder", root)
-    _deny_read(models, folder, session)
-    _grant_read(models, session, user, folder, "directory")
+    _set_dacl(
+        session,
+        folder,
+        f'inherit off; allow [PRESET_READ] to user("{user.id}");',
+    )
     session.commit()
     original_id = user.id
 
@@ -324,34 +335,41 @@ def test_denies_the_entire_chain_when_any_folder_is_hidden(
     ancestor = _add_folder(models, session, "ancestor", "ancestor", root)
     terminal = _add_folder(models, session, "terminal", "terminal", ancestor)
     targets = {"root": root, "ancestor": ancestor, "terminal": terminal}
-    _deny_read(models, targets[hidden_level], session)
+    _set_dacl(session, targets[hidden_level], "inherit off;")
 
     assert resolve_authorized_node_ids(
         session, user, ("ancestor", "terminal")
     ) is None
 
 
-def test_terminal_oae_does_not_reveal_a_hidden_ancestor(database_session) -> None:
+def test_terminal_allow_does_not_reveal_a_hidden_ancestor(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session)
     root = session.get(models.Folder, "/")
     ancestor = _add_folder(models, session, "ancestor", "ancestor", root)
     terminal = _add_folder(models, session, "terminal", "terminal", ancestor)
-    _deny_read(models, ancestor, session)
-    _grant_read(models, session, user, terminal, "directory")
+    _set_dacl(session, ancestor, "inherit off;")
+    _set_dacl(
+        session,
+        terminal,
+        f'inherit off; allow [PRESET_READ] to user("{user.id}");',
+    )
 
     assert resolve_authorized_node_ids(
         session, user, ("ancestor", "terminal")
     ) is None
 
 
-def test_terminal_document_oae_overrides_its_own_rule_only(database_session) -> None:
+def test_terminal_document_dacl_overrides_its_own_inherit_off(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session)
     root = session.get(models.Folder, "/")
     document = _add_document(models, session, "document", "document", root)
-    _deny_read(models, document, session)
-    _grant_read(models, session, user, document, "document")
+    _set_dacl(
+        session,
+        document,
+        f'inherit off; allow [READ_METADATA] to user("{user.id}");',
+    )
 
     assert resolve_authorized_node_ids(session, user, ("document",)) == (
         "/",
@@ -359,44 +377,40 @@ def test_terminal_document_oae_overrides_its_own_rule_only(database_session) -> 
     )
 
 
-@pytest.mark.parametrize(
-    ("target_type", "target_id"),
-    [("all", None), ("directory", "folder")],
-)
-def test_user_read_blocks_fail_closed(database_session, target_type, target_id) -> None:
+def test_explicit_deny_overrides_inherited_allow(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session)
     root = session.get(models.Folder, "/")
-    _add_folder(models, session, "folder", "folder", root)
-    _block_read(
-        models,
+    folder = _add_folder(models, session, "folder", "folder", root)
+    child = _add_folder(models, session, "child", "child", folder)
+
+    _set_dacl(
         session,
-        user,
-        target_type=target_type,
-        target_id=target_id,
+        folder,
+        f'deny [LIST_DIRECTORY, READ_METADATA] on self to user("{user.id}");',
+    )
+    assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+    # Inherited TRAVERSE from `/` still permits reaching visible child.
+    assert resolve_authorized_node_ids(session, user, ("folder", "child")) == (
+        "/",
+        "folder",
+        "child",
     )
 
-    assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+    _set_dacl(session, folder, f'deny [TRAVERSE] to user("{user.id}");')
+    assert resolve_authorized_node_ids(session, user, ("folder", "child")) is None
 
 
-def test_group_oae_can_authorize_a_visible_terminal(database_session) -> None:
+def test_group_dacl_can_authorize_a_visible_terminal(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session, groups=("readers",))
     root = session.get(models.Folder, "/")
     folder = _add_folder(models, session, "folder", "folder", root)
-    _deny_read(models, folder, session)
-    session.add(
-        models.ObjectAccessEntry(
-            entity_type="group",
-            entity_identifier="readers",
-            target_type="directory",
-            target_identifier=folder.id,
-            access_type="read",
-            start_time=0.0,
-            end_time=None,
-        )
+    _set_dacl(
+        session,
+        folder,
+        'inherit off; allow [LIST_DIRECTORY] to group("readers");',
     )
-    session.flush()
 
     assert resolve_authorized_node_ids(session, user, ("folder",)) == (
         "/",
@@ -404,7 +418,7 @@ def test_group_oae_can_authorize_a_visible_terminal(database_session) -> None:
     )
 
 
-def test_group_oae_does_not_match_a_user_uuid(database_session) -> None:
+def test_group_dacl_does_not_match_a_user_uuid(database_session) -> None:
     models, session = database_session
     user = _make_user(models, session, username="shared-name")
     session.add(
@@ -415,44 +429,53 @@ def test_group_oae_does_not_match_a_user_uuid(database_session) -> None:
     )
     root = session.get(models.Folder, "/")
     folder = _add_folder(models, session, "folder", "folder", root)
-    _deny_read(models, folder, session)
-    session.add(
-        models.ObjectAccessEntry(
-            entity_type="group",
-            entity_identifier=str(user.id),
-            target_type="directory",
-            target_identifier=folder.id,
-            access_type="read",
-            start_time=0.0,
-            end_time=None,
-        )
+    _set_dacl(
+        session,
+        folder,
+        f'inherit off; allow [PRESET_READ] to group("{user.id}");',
     )
-    session.flush()
 
     assert resolve_authorized_node_ids(session, user, ("folder",)) is None
 
 
-def test_user_oae_does_not_match_a_group_with_the_same_identifier(database_session) -> None:
+def test_user_dacl_does_not_match_a_group_with_the_same_identifier(
+    database_session,
+) -> None:
     models, session = database_session
     other_user = _make_user(models, session, username="shared-name")
     user = _make_user(models, session, username="alice", groups=(str(other_user.id),))
     root = session.get(models.Folder, "/")
     folder = _add_folder(models, session, "folder", "folder", root)
-    _deny_read(models, folder, session)
-    session.add(
-        models.ObjectAccessEntry(
-            entity_type="user",
-            entity_identifier=str(other_user.id),
-            target_type="directory",
-            target_identifier=folder.id,
-            access_type="read",
-            start_time=0.0,
-            end_time=None,
-        )
+    _set_dacl(
+        session,
+        folder,
+        f'inherit off; allow [PRESET_READ] to user("{other_user.id}");',
     )
-    session.flush()
 
     assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+
+
+def test_perm_dacl_keeps_principal_namespaces_separate(database_session) -> None:
+    from include.domains.access.permissions import Permissions
+
+    models, session = database_session
+    user = _make_user(models, session, groups=(Permissions.SEARCH.value,))
+    root = session.get(models.Folder, "/")
+    folder = _add_folder(models, session, "folder", "folder", root)
+    _set_dacl(
+        session,
+        folder,
+        f'inherit off; allow [PRESET_READ] when perm("{Permissions.SEARCH.value}");',
+    )
+
+    # Holding a group named "search" must not satisfy perm("search").
+    assert resolve_authorized_node_ids(session, user, ("folder",)) is None
+
+    _grant_permission(models, session, user, Permissions.SEARCH)
+    assert resolve_authorized_node_ids(session, user, ("folder",)) == (
+        "/",
+        "folder",
+    )
 
 
 @pytest.mark.parametrize(
@@ -460,7 +483,7 @@ def test_user_oae_does_not_match_a_group_with_the_same_identifier(database_sessi
     [(time.time() + 3600, None), (0.0, time.time() - 3600)],
     ids=["future", "expired"],
 )
-def test_group_oae_requires_an_active_membership(
+def test_group_dacl_requires_an_active_membership(
     database_session, membership_start, membership_end
 ) -> None:
     models, session = database_session
@@ -481,43 +504,181 @@ def test_group_oae_requires_an_active_membership(
     membership.end_time = membership_end
     root = session.get(models.Folder, "/")
     folder = _add_folder(models, session, "folder", "folder", root)
-    _deny_read(models, folder, session)
-    session.add(
-        models.ObjectAccessEntry(
-            entity_type="group",
-            entity_identifier="readers",
-            target_type="directory",
-            target_identifier=folder.id,
-            access_type="read",
-            start_time=0.0,
-            end_time=None,
-        )
+    _set_dacl(
+        session,
+        folder,
+        'inherit off; allow [PRESET_READ] to group("readers");',
     )
-    session.flush()
 
     assert resolve_authorized_node_ids(session, user, ("folder",)) is None
 
 
-def test_non_inheriting_child_still_requires_visible_path_ancestors(
+def test_cacl_rule_validity_windows_are_enforced(database_session) -> None:
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    now = datetime.datetime.now(datetime.UTC)
+
+    future_start = (now + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    past_start = (now - datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    past_end = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    active_end = (now + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    future_folder = _add_folder(models, session, "future", "future", root)
+    _set_dacl(
+        session,
+        future_folder,
+        f'inherit off; allow [PRESET_READ] to any from "{future_start}";',
+        now_utc=now,
+    )
+    expired_folder = _add_folder(models, session, "expired", "expired", root)
+    _set_dacl(
+        session,
+        expired_folder,
+        f'inherit off; allow [PRESET_READ] to any from "{past_start}" until "{past_end}";',
+        now_utc=now - datetime.timedelta(hours=3),
+    )
+    active_folder = _add_folder(models, session, "active", "active", root)
+    _set_dacl(
+        session,
+        active_folder,
+        f'inherit off; allow [PRESET_READ] to any from "{past_start}" until "{active_end}";',
+        now_utc=now,
+    )
+
+    assert resolve_authorized_node_ids(session, user, ("future",)) is None
+    assert resolve_authorized_node_ids(session, user, ("expired",)) is None
+    assert resolve_authorized_node_ids(session, user, ("active",)) == (
+        "/",
+        "active",
+    )
+
+
+def test_cacl_scopes_filter_directories_vs_documents(database_session) -> None:
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    scoped = _add_folder(models, session, "scoped", "scoped", root)
+    _set_dacl(
+        session,
+        scoped,
+        (
+            "inherit off;\n"
+            "allow [TRAVERSE] on self to any;\n"
+            "allow [READ_CONTENT] on docs to any;\n"
+        ),
+    )
+    _add_folder(models, session, "sub", "sub", scoped)
+    _add_document(models, session, "doc", "doc", scoped)
+
+    assert resolve_authorized_node_ids(session, user, ("scoped",)) is None
+    assert resolve_authorized_node_ids(session, user, ("scoped", "sub")) is None
+    assert resolve_authorized_node_ids(session, user, ("scoped", "doc")) == (
+        "/",
+        "scoped",
+        "doc",
+    )
+
+
+def test_traverse_only_ancestor_allows_visible_child_but_not_ancestor(
     database_session,
 ) -> None:
     models, session = database_session
     user = _make_user(models, session)
     root = session.get(models.Folder, "/")
     ancestor = _add_folder(models, session, "ancestor", "ancestor", root)
-    _add_folder(
+    _set_dacl(session, ancestor, "inherit off; allow [TRAVERSE] to any;")
+    child = _add_folder(models, session, "child", "child", ancestor)
+    _set_dacl(session, child, "inherit off; allow [LIST_DIRECTORY] to any;")
+
+    assert resolve_authorized_node_ids(session, user, ("ancestor",)) is None
+    assert resolve_authorized_node_ids(session, user, ("ancestor", "child")) == (
+        "/",
+        "ancestor",
+        "child",
+    )
+
+
+def test_list_directory_without_traverse_blocks_descendants(database_session) -> None:
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    ancestor = _add_folder(models, session, "ancestor", "ancestor", root)
+    _set_dacl(session, ancestor, "inherit off; allow [LIST_DIRECTORY] to any;")
+    child = _add_folder(models, session, "child", "child", ancestor)
+    _set_dacl(session, child, "inherit off; allow [LIST_DIRECTORY] to any;")
+
+    assert resolve_authorized_node_ids(session, user, ("ancestor",)) == (
+        "/",
+        "ancestor",
+    )
+    assert resolve_authorized_node_ids(session, user, ("ancestor", "child")) is None
+
+
+def test_bypass_traverse_checking_permission_and_option(database_session) -> None:
+    from include.domains.access.permissions import Permissions
+
+    models, session = database_session
+    user = _make_user(models, session)
+    root = session.get(models.Folder, "/")
+    ancestor = _add_folder(models, session, "ancestor", "ancestor", root)
+    _set_dacl(session, ancestor, "inherit off;")
+    terminal = _add_folder(models, session, "terminal", "terminal", ancestor)
+    _set_dacl(session, terminal, "inherit off; allow [READ_METADATA] to any;")
+
+    assert resolve_authorized_node_ids(session, user, ("ancestor", "terminal")) is None
+
+    # Database option enables traverse bypass globally while keeping ancestor invisible.
+    _set_bypass_traverse_option(session, True)
+    assert resolve_authorized_node_ids(session, user, ("ancestor",)) is None
+    assert resolve_authorized_node_ids(session, user, ("ancestor", "terminal")) == (
+        "/",
+        "ancestor",
+        "terminal",
+    )
+
+    _set_bypass_traverse_option(session, False)
+    assert resolve_authorized_node_ids(session, user, ("ancestor", "terminal")) is None
+
+    # Per-user BYPASS_TRAVERSE_CHECKING permission grants the same bypass.
+    _grant_permission(models, session, user, Permissions.BYPASS_TRAVERSE_CHECKING)
+    assert resolve_authorized_node_ids(session, user, ("ancestor",)) is None
+    assert resolve_authorized_node_ids(session, user, ("ancestor", "terminal")) == (
+        "/",
+        "ancestor",
+        "terminal",
+    )
+
+
+def test_bypass_dacl_resolves_hidden_live_nodes_but_rejects_deleted_and_unpublished(
+    database_session,
+) -> None:
+    from include.domains.access.permissions import Permissions
+
+    models, session = database_session
+    admin = _make_user(
         models,
         session,
-        "terminal",
-        "terminal",
-        ancestor,
-        inherit=False,
+        username="admin",
+        permissions=(Permissions.BYPASS_DACL,),
     )
-    _deny_read(models, ancestor, session)
+    root = session.get(models.Folder, "/")
+    _set_dacl(session, root, "inherit off;")
+    hidden = _add_folder(models, session, "hidden", "hidden", root)
+    _set_dacl(session, hidden, "inherit off; deny [TRAVERSE, LIST_DIRECTORY] to any;")
+    _add_document(models, session, "doc", "doc", hidden, active=True)
+    _add_document(models, session, "draft", "draft", hidden, active=False)
+    deleted = _add_folder(models, session, "deleted", "deleted", hidden)
+    deleted.status = models.EntityStatus.DELETED
+    session.flush()
 
-    assert resolve_authorized_node_ids(
-        session, user, ("ancestor", "terminal")
-    ) is None
+    assert resolve_authorized_node_ids(session, admin, ("hidden", "doc")) == (
+        "/",
+        "hidden",
+        "doc",
+    )
+    assert resolve_authorized_node_ids(session, admin, ("hidden", "draft")) is None
+    assert resolve_authorized_node_ids(session, admin, ("hidden", "deleted")) is None
 
 
 def test_authorization_queries_have_a_fixed_overhead_over_path_resolution(

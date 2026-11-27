@@ -42,11 +42,11 @@ jobs:
           ref: ${{ steps.release.outputs.tag }}
           path: ext_node_lookup
 
-      - name: Check out CFMS server (0.13.0 baseline)
+      - name: Check out CFMS server (0.15.0 baseline)
         uses: actions/checkout@v7
         with:
           repository: cfms-dev/cfms_on_websocket
-          ref: v0.13.0
+          ref: v0.15.0
           path: cfms_on_websocket
 
       - name: Set up Python 3.15
@@ -103,7 +103,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: cfms-dev/cfms_on_websocket
-          ref: v0.13.0
+          ref: v0.15.0
           path: cfms_on_websocket
 
       - name: Set up Python 3.15
@@ -185,7 +185,7 @@ jobs:
           )
           PY
 
-      - name: Verify package discovery and ZIP installation
+      - name: Verify package discovery and compatibility
         env:
           PYTHONPATH: ${{ github.workspace }}/cfms_on_websocket/src
           RELEASE_VERSION: ${{ needs.validate-and-test.outputs.version }}
@@ -194,12 +194,13 @@ jobs:
           import hashlib
           import os
           import shutil
-          import subprocess
-          import sys
           from pathlib import Path
           from tempfile import TemporaryDirectory
 
-          from include.extensions.manager import discover_extensions
+          from include.extensions.manager import (
+              discover_extensions,
+              resolve_extension_selection,
+          )
 
           expected_version = os.environ["RELEASE_VERSION"]
           for archive_type in ("zip", "tar"):
@@ -217,37 +218,31 @@ jobs:
                       f"match {expected_version!r}"
                   )
 
-          package_path = Path(f"dist/node_lookup-{expected_version}.zip").resolve()
-          digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
-          sample_config = Path("cfms_on_websocket/src/config.toml.sample").resolve()
-          with TemporaryDirectory(prefix="node-lookup-install-") as temporary:
-              runtime = Path(temporary) / "src"
-              extension_root = runtime / "include" / "extensions"
-              extension_root.mkdir(parents=True)
-              (runtime / "main.py").touch()
-              (runtime / "init").touch()
-              shutil.copyfile(sample_config, runtime / "config.toml")
-              subprocess.run(
-                  [
-                      sys.executable,
-                      "-c",
-                      "from maintenance.cli import app; app()",
-                      "extension", "install", str(package_path),
-                      "--sha256", digest, "--yes",
-                  ],
-                  cwd=runtime,
-                  check=True,
-              )
-              installed = discover_extensions(extension_root)
-              if set(installed) != {"node_lookup"}:
-                  raise SystemExit("ZIP installation did not create node_lookup")
-              if installed["node_lookup"].manifest.extension.version != expected_version:
-                  raise SystemExit("ZIP installation returned an unexpected version")
-              extracted = Path("dist/verification/zip/node_lookup")
-              for source in extracted.iterdir():
-                  target = extension_root / "node_lookup" / source.name
-                  if target.read_bytes() != source.read_bytes():
-                      raise SystemExit(f"Installed ZIP content differs: {source.name}")
+          expected_checksums = {}
+          for line in Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, filename = line.split("  ", maxsplit=1)
+              expected_checksums[filename] = digest
+          for filename in (
+              f"node_lookup-{expected_version}.zip",
+              f"node_lookup-{expected_version}.tar.gz",
+          ):
+              actual_digest = hashlib.sha256((Path("dist") / filename).read_bytes()).hexdigest()
+              if expected_checksums.get(filename) != actual_digest:
+                  raise SystemExit(f"SHA256SUMS.txt mismatch for {filename}")
+
+          builtin_dir = Path("cfms_on_websocket/src/include/extensions/builtin").resolve()
+          extracted = Path("dist/verification/zip/node_lookup").resolve()
+          with TemporaryDirectory(prefix="node-lookup-compat-") as temporary:
+              catalog = Path(temporary) / "extensions"
+              shutil.copytree(builtin_dir, catalog / "builtin")
+              shutil.copytree(extracted, catalog / "node_lookup")
+              discovered = discover_extensions(catalog)
+              ordered = resolve_extension_selection(discovered, ["node_lookup"])
+              if [ext.manifest.extension.identifier for ext in ordered] != [
+                  "builtin",
+                  "node_lookup",
+              ]:
+                  raise SystemExit(f"unexpected load order: {ordered!r}")
           PY
 
       - name: Upload release packages

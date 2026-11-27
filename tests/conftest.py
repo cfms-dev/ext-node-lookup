@@ -44,19 +44,13 @@ def isolated_server_runtime(server_root: Path, tmp_path_factory):
 
         # CFMS resolves config and database files from these paths, not cwd.
         patch.setattr(paths, "EXECUTABLE_ABSPATH", runtime_dir)
-        patch.setattr(paths, "PROJECT_ABSPATH", runtime_dir.parent)
         patch.setattr(paths, "EXTENSION_ROOT", runtime_dir / "include" / "extensions")
         try:
             yield runtime_dir
         finally:
-            config_module = sys.modules.get("include.config.settings")
             database_module = sys.modules.get("include.database.session")
-            try:
-                if config_module is not None:
-                    config_module.global_config.stop()
-            finally:
-                if database_module is not None:
-                    database_module.engine.dispose()
+            if database_module is not None:
+                database_module.engine.dispose()
 
 
 @pytest.fixture()
@@ -66,6 +60,11 @@ def database_session():
 
     import include.database.models as models
     from include.database.session import Base
+    from include.domains.access.authorization.storage import (
+        DEFAULT_ROOT_DACL_SOURCE,
+        compile_policy_source,
+        persist_node_policy,
+    )
 
     engine = create_engine("sqlite:///:memory:")
 
@@ -78,7 +77,12 @@ def database_session():
     Base.metadata.create_all(engine)
     testing_session = sessionmaker(bind=engine)
     with testing_session() as session:
-        session.add(models.Folder(id="/", name="/", inherit=False))
+        root = models.Folder(id="/", name="/", inherit=False)
+        session.add(root)
+        session.flush()
+        compiled = compile_policy_source(session, DEFAULT_ROOT_DACL_SOURCE)
+        assert compiled.policy is not None
+        persist_node_policy(session, root, compiled.policy)
         session.commit()
         yield models, session
     engine.dispose()
